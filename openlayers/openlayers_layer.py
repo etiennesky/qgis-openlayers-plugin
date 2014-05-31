@@ -30,6 +30,7 @@ from tools_network import getProxy
 
 import os.path
 import math
+import sys
 
 debuglevel = 4  # 0 (none) - 4 (all)
 
@@ -56,23 +57,30 @@ class OLWebPage(QWebPage):
 
 # this is a worker class which is responsible for fetching the map
 # it resides normally in the gui thread, except when doind paint()
-class OpenlayersWorker(QObject):
+class OpenlayersController(QObject):
 
-    startSignal = PyQt4.QtCore.pyqtSignal()
-    doneSignal = PyQt4.QtCore.pyqtSignal()
+    # signal that reports to the worker thread that the image is ready
+    finished = pyqtSignal()
 
-    #def __init__(self, mapSettings, layerType):
     def __init__(self, rendererContext, mapSettings, layerType):
-
         QObject.__init__(self)
 
-        debug('OpenlayersWorker init - ' + ' - ' + str(QThread.currentThreadId()), 2)
+        # img vars
+        self.viewportSize = QSize(400, 400)
+        self.img = QImage(self.viewportSize, QImage.Format_ARGB32)
+        #self.img = None
+
+        #web page vars
+        self.page = OLWebPage()
+        #self.page.setViewportSize(self.viewportSize)
+        self.page.loadFinished.connect(self.pageFinished)
+
+        # specific vars
         self.rendererContext = rendererContext
         self.mapSettings = mapSettings
         self.layerType = layerType
 
         self.loaded = False
-        self.page = OLWebPage()
         self.ext = None
         self.olResolutions = None
 
@@ -83,91 +91,83 @@ class OpenlayersWorker(QObject):
         self.lastOutputDpi = None
         self.lastMapUnitsPerPixel = None
 
-        self.working = False
-
-        self.timer = QTimer()
-        self.timer.setSingleShot(True)
-        self.timer.setInterval(500)
-        QObject.connect(self.timer, SIGNAL("timeout()"), self.finalRepaint)
-
-        self.timerMax = QTimer()
-        self.timerMax.setSingleShot(True)
-        self.timerMax.setInterval(5000)  # TODO: different timeouts for google/yahoo?
-        QObject.connect(self.timerMax, SIGNAL("timeout()"), self.finalRepaint)
-
         # timeout for loadEnd event
         self.timerLoadEnd = QTimer()
         self.timerLoadEnd.setSingleShot(True)
         self.timerLoadEnd.setInterval(5000)
         QObject.connect(self.timerLoadEnd, SIGNAL("timeout()"), self.loadEndTimeout)
 
-        self.startSignal.connect(self.startRender)
 
-    def startRender(self):
-        debug('OpenlayersWorker startRender - ' + str(QThread.currentThreadId()), 2)
-        #QThread.currentThread().sleep(2)
-        self.working = True
-        self.render()
-        #self.doneRender()
-        self.working = False
-        self.doneSignal.emit()
-        debug('OpenlayersWorker startRender done', 2)
+    @pyqtSlot()
+    def request(self):
+        sys.stderr.write("[GUI THREAD] Processing request\n")
+        self.cancelled = False
+        #url = QUrl("http://qgis.org/")
+        #url = QUrl(os.path.join(os.path.dirname(__file__), "testpage.html"))
+        #self.page.mainFrame().load(url)
 
-    # def doneRender(self):
-    #     debug('OpenlayersWorker doneRender- '+str(QThread.currentThreadId()), 2)
-    #     self.doneSignal.emit()
+        debug("OpenlayersController request " + str(QThread.currentThreadId()))
 
-    # def paint(self):
-    #     debug('OpenlayersWorker paint- '+str(QThread.currentThreadId()), 2)
+        olSize = self.rendererContext.painter().viewport().size()
+        self.page.setViewportSize(olSize)
 
-    # below copied from non-MT OpenlayersLayer
+        #self.page = OLWebPage()
+        url = self.layerType.html_url()
+        debug("page file: %s" % url)
+        self.page.mainFrame().load(QUrl(url))
 
-    def pageRepaintRequested(self, rect):
-        debug("OpenlayersLayer pageRepaintRequested", 2)
-        if self.loaded:
-            self.timer.stop()
-            self.repaintEnd = False
-            self.timer.start()
+
+    def waitForLoadEnd(self):
+        if self.layerType.emitsLoadEnd:
+            debug('waiting for loadEnd', 3)
+            # wait for OpenLayers to finish loading
+            # NOTE: does not work with Google and Yahoo layers as they do not emit loadstart and loadend events
+            self.loadEnd = False
+            self.timerLoadEnd.start()
+            while not self.loadEnd:
+                loadEndOL = self.page.mainFrame().evaluateJavaScript("loadEnd")
+                #debug('waiting ' + str(rendererContext.renderingStopped()) + ' ' + str(loadEndOL), 4)
+                #debug("loadEndOL: %d" % loadEndOL, 3)
+                #if not loadEndOL.isNull():
+                if not loadEndOL is None:
+                    self.loadEnd = loadEndOL
+                else:
+                    debug("OpenlayersLayer Warning: Could not get loadEnd")
+                    break
+                qApp.processEvents()
+            self.timerLoadEnd.stop()
+            debug('done waiting for loadEnd', 3)
         else:
-            self.repaintEnd = True
+            debug('waiting for pageRepaintRequested', 3)
+                # wait for timeout after pageRepaintRequested
+            self.repaintEnd = False
+            self.timerMax.start()
+            while not self.repaintEnd:
+                qApp.processEvents()
+            self.timerMax.stop()
+            debug('done waiting for pageRepaintRequested', 3)
 
-    def finalRepaint(self):
-        debug("OpenlayersLayer finalRepaint")
-        self.repaintEnd = True
-
-    def loadFinished(self, ok):
-        debug("OpenlayersLayer loadFinished %d" % ok)
-        if ok:
-            self.loaded = ok
-            self.emit(SIGNAL("repaintRequested()"))
-
+    def cancel(self):
+        self.cancelled = True
+        self.timerLoadEnd.stop()
+        
     def loadEndTimeout(self):
         debug("OpenlayersLayer loadEndTimeout")
         self.loadEnd = True
 
-    # copied from OpenlayersLayer draw() and render()
-    def render(self):
-        debug("OpenlayersWorker render " + str(QThread.currentThreadId()))
+    def pageFinished(self):
+        print('pageFinished')
+
+        sys.stderr.write("[GUI THREAD] Request finished\n")
+
+        if self.cancelled:
+            self.img = None
+            self.finished.emit()
+            return
+        
+        #self.waitForLoadEnd()
 
         rendererContext = self.rendererContext
-
-        if not rendererContext or rendererContext.renderingStopped():
-            return False
-
-        if not self.loaded:
-            self.page = OLWebPage()
-            url = self.layerType.html_url()
-            debug("page file: %s" % url)
-            self.page.mainFrame().load(QUrl(url))
-            QObject.connect(self.page, SIGNAL("loadFinished(bool)"), self.loadFinished)
-            if not self.layerType.emitsLoadEnd:
-                QObject.connect(self.page, SIGNAL("repaintRequested(QRect)"), self.pageRepaintRequested)
-
-            # wait for page to finish loading
-            debug("OpenlayersWorker waiting for page to load", 3)
-            while not self.loaded:
-                qApp.processEvents()
-            debug("OpenlayersWorker page loaded", 3)
 
         outputDpi = self.mapSettings.outputDpi()
         debug(" extent: %s" % rendererContext.extent().toString(), 3)
@@ -211,55 +211,26 @@ class OpenlayersWorker(QObject):
             if rendererContext.extent() != self.ext:
                 self.ext = rendererContext.extent()  # FIXME: store seperate for each rendererContext
                 debug("updating OpenLayers extent (%f, %f, %f, %f)" % (self.ext.xMinimum(), self.ext.yMinimum(), self.ext.xMaximum(), self.ext.yMaximum()), 3)
-                self.page.mainFrame().evaluateJavaScript(
+                bla = self.page.mainFrame().evaluateJavaScript(
                     "map.zoomToExtent(new OpenLayers.Bounds(%f, %f, %f, %f), true);" %
                     (self.ext.xMinimum(), self.ext.yMinimum(), self.ext.xMaximum(), self.ext.yMaximum()))
+                print(str(bla))
                 debug("map.zoomToExtent finished", 3)
 
-            if self.layerType.emitsLoadEnd:
-                debug('waiting for loadEnd', 3)
-                # wait for OpenLayers to finish loading
-                # NOTE: does not work with Google and Yahoo layers as they do not emit loadstart and loadend events
-                self.loadEnd = False
-                self.timerLoadEnd.start()
-                while not self.loadEnd:
-                    loadEndOL = self.page.mainFrame().evaluateJavaScript("loadEnd")
-                    debug('waiting ' + str(rendererContext.renderingStopped()) + ' ' + str(loadEndOL), 4)
-                    #debug("loadEndOL: %d" % loadEndOL, 3)
-                    #if not loadEndOL.isNull():
-                    if not loadEndOL is None:
-                        self.loadEnd = loadEndOL
-                    else:
-                        debug("OpenlayersLayer Warning: Could not get loadEnd")
-                        break
-                    qApp.processEvents()
-                self.timerLoadEnd.stop()
-                debug('done waiting for loadEnd', 3)
-            else:
-                debug('waiting for pageRepaintRequested', 3)
-                # wait for timeout after pageRepaintRequested
-                self.repaintEnd = False
-                self.timerMax.start()
-                while not self.repaintEnd:
-                    qApp.processEvents()
-                self.timerMax.stop()
-                debug('done waiting for pageRepaintRequested', 3)
+            self.waitForLoadEnd()
 
-            debug("OpenlayersWorker rendering page to img", 3)
+            if self.cancelled:
+                self.img = None
+                self.finished.emit()
+                return
 
-            if not rendererContext or not rendererContext.painter():
-                debug("OpenlayersWorker stopping rendering because renderingContext was deleted")
-                return True
-
-            if rendererContext.renderingStopped():
-                debug("OpenlayersWorker stopping rendering because renderingContext stopped")
-                return True
+            debug("OpenlayersController rendering page to img", 3)
 
             #Render WebKit page into rendererContext
-            debug('before save', 4)
-            rendererContext.painter().save()
-            debug('after save', 4)
-            painter_saved = True
+            #debug('before save', 4)
+            #rendererContext.painter().save()
+            #debug('after save', 4)
+            #painter_saved = True
             if rendererContext.painter().device().logicalDpiX() != int(outputDpi):
                 printScale = 25.4 / outputDpi  # OL DPI to printer pixels
                 rendererContext.painter().scale(printScale, printScale)
@@ -269,6 +240,7 @@ class OpenlayersWorker(QObject):
             painter = QPainter(img)
             self.page.mainFrame().render(painter)
             painter.end()
+            img.save("/tmp/openlayers.png")
 
             if olWidth != targetWidth or olHeight != targetHeight:
                 # scale using QImage for better quality
@@ -276,27 +248,31 @@ class OpenlayersWorker(QObject):
                 debug("    scale image: %i x %i -> %i x %i" % (olWidth, olHeight, targetWidth, targetHeight), 3)
 
         else:
-            debug("OpenlayersWorker using cached img", 3)
+            debug("OpenlayersController using cached img", 3)
             img = self.lastRenderedImage
 
-        debug("OpenlayersWorker rendering img to painter", 3)
+#        debug("OpenlayersController rendering img to painter", 3)
 
-        # draw to rendererContext
-        rendererContext.painter().drawImage(0, 0, img)
-        if painter_saved:
-            rendererContext.painter().restore()
+#        # draw to rendererContext
+#        rendererContext.painter().drawImage(0, 0, img)
+#        if painter_saved:
+#            rendererContext.painter().restore()
 
-        debug("OpenlayersWorker done rendering img to painter", 3)
+#        debug("OpenlayersController done rendering img to painter", 3)
 
         # save current state
         self.lastRenderedImage = img
+        self.img = img
         self.lastExtent = rendererContext.extent()
         self.lastViewPortSize = rendererContext.painter().viewport().size()
         self.lastLogicalDpi = rendererContext.painter().device().logicalDpiX()
         self.lastOutputDpi = self.mapSettings.outputDpi()
         self.lastMapUnitsPerPixel = rendererContext.mapToPixel().mapUnitsPerPixel()
 
-        debug("OpenlayersWorker render done")
+        self.finished.emit()
+
+        debug("OpenlayersController render done")
+
 
     #def scaleFromExtent(self, extent):
 
@@ -310,54 +286,54 @@ class OpenlayersWorker(QObject):
         return self.olResolutions
 
 
-# this is a map renderer which resides in a worker thread, and uses a OpenlayersWorker
+# this is a map renderer which resides in a worker thread, and uses a OpenlayersController
 # which resides in the gui thread to do fetch the map
 class OpenlayersRenderer(QgsMapLayerRenderer):
 
-    def __init__(self, layerID, rendererContext, mapSettings, layerType):
-        QgsMapLayerRenderer.__init__(self, layerID)
+    def __init__(self, layer, context, mapSettings, layerType):
+
+        QgsMapLayerRenderer.__init__(self, layer.id())
+
         debug('OpenlayersRenderer __init__ ' + self.layerID() + ' - ' + str(QThread.currentThreadId()))
-        #self.worker = worker
-        self.worker = OpenlayersWorker(rendererContext, mapSettings, layerType)
 
-        #self.worker.startSignal.connect(self.worker.startRender)
-
-    #def __del__(self):
-    #    debug('OpenlayersRenderer __del__')
-    #    self.worker.startSignal.disconnect(self.worker.startRender)
-
-#    def setRendererContext(self, rendererContext):
-#        self.worker.rendererContext = rendererContext
+        self.context = context
+        self.controller = OpenlayersController(context, mapSettings, layerType)
+        self.loop = None
 
     def render(self):
-        debug('OpenlayersRenderer render - ' + str(QThread.currentThreadId()), 3)
+        """ do the rendering. This function is called in the worker thread """
 
-        self.worker.moveToThread(QApplication.instance().thread())
-        self.worker.working = True
-        self.worker.startSignal.emit()
+        sys.stderr.write("[WORKER THREAD] Calling request() asynchronously\n")
+        QMetaObject.invokeMethod(self.controller, "request")
 
-        #loop = QEventLoop()
-        #QObject.connect(self.worker, SIGNAL("doneSignal()"), loop, SLOT("quit()"), Qt.QueuedConnection)
-        ##debug('OpenlayersRenderer start loop - '+str(QThread.currentThreadId()))
-        #loop.exec_()
-        ##debug('OpenlayersRenderer done loop - '+str(QThread.currentThreadId()))
-        #QObject.disconnect(self.worker, SIGNAL("doneSignal()"), loop, SLOT("quit()"))
+        # setup a timer that checks whether the rendering has not been stopped in the meanwhile
+        timer = QTimer()
+        timer.setInterval(50)
+        timer.timeout.connect(self.onTimeout)
+        timer.start()
 
-        while self.worker.working and not self.worker.rendererContext.renderingStopped():
-            #print('waiting')
-            qApp.processEvents()
-            QThread.currentThread().msleep(100)
-        if debug > 2:
-            print('done waiting')
+        sys.stderr.write("[WORKER THREAD] Waiting for the async request to complete\n")
+        self.loop = QEventLoop()
+        self.controller.finished.connect(self.loop.exit)
+        self.loop.exec_()
 
-        debug('OpenlayersRenderer render done', 3)
+        sys.stderr.write("[WORKER THREAD] Async request finished\n")
 
-        #self.worker.paint()
+        if self.controller.img:
+            sys.stderr.write("[WORKER THREAD] drawing controller image\n")
+            painter = self.context.painter()
+            painter.drawImage(0, 0, self.controller.img)
+        else:
+            sys.stderr.write("[WORKER THREAD] no controller image to draw\n")
 
         return True
 
-    # def done(self):
-    #     debug('OpenlayersRenderer done - '+str(QThread.currentThreadId()))
+    def onTimeout(self):
+        """ periodically check whether the rendering should not be stopped """
+        if self.context.renderingStopped():
+            sys.stderr.write("[WORKER THREAD] Cancelling rendering\n")
+            self.controller.cancel()
+            self.loop.exit()
 
 
 class OpenlayersLayer(QgsPluginLayer):
@@ -408,5 +384,5 @@ class OpenlayersLayer(QgsPluginLayer):
         debug('OpenLayers createMapRenderer ' + str(QThread.currentThreadId()) + ' - ' + str(rendererContext.mapToPixel().mapUnitsPerPixel()), 3)
         #self.worker.rendererContext = rendererContext
         #self.mapRenderer = OpenlayersRenderer(self.id(), self.worker)#, rendererContext, self.iface.mapCanvas().mapSettings(), self.layerType)
-        self.mapRenderer = OpenlayersRenderer(self.id(), rendererContext, self.iface.mapCanvas().mapSettings(), self.layerType)
+        self.mapRenderer = OpenlayersRenderer(self, rendererContext, self.iface.mapCanvas().mapSettings(), self.layerType)
         return self.mapRenderer
